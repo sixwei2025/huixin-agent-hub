@@ -1,7 +1,7 @@
 ---
 name: huixin-agent-hub
 display_name: 汇芯智能体中台（多引擎中文桌面工作台）
-version: 0.5.0
+version: 0.5.1
 description: 汇芯智能体中台桌面应用源码与本机安装引导技能。将 Codex、Antigravity、WorkBuddy 三套本机智能体放进同一个中文 macOS 桌面窗口，按业务类别派活、追问、审批与归档，并支持通过 Obsidian 共享工作记忆实现跨平台上下文衔接。
 author: 袁六伟 · 台州汇芯（公众号/视频号：袁六伟）
 ---

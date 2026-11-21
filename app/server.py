@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '0.5.0'
+VERSION = '0.5.1'
 CATEGORIES = ['内容生产', '企业商单', '课程交付', '技能开发', '经营管理', '系统维护']
 DEFAULT_PROVIDERS = {
     'codex': {
@@ -579,10 +579,83 @@ class Hub:
         ok = bool(res and 'result' in res)
         self._finish(task_id, messages, ''.join(chunks), ok, sid, err_of(res, '智能体执行未返回结果'))
 
+    def _obsidian_config_path(self):
+        return self.data / 'obsidian.json'
+
+    def get_obsidian_config(self):
+        p = self._obsidian_config_path()
+        cfg = {'enabled': False, 'vault_path': '', 'context_file': '', 'max_chars': 3000}
+        if p.exists():
+            try:
+                raw = json.loads(p.read_text(encoding='utf-8'))
+                if isinstance(raw, dict):
+                    cfg.update({k: raw[k] for k in cfg if k in raw})
+            except Exception:
+                pass
+        ctx_path = self._resolve_obsidian_context_path(cfg)
+        cfg['context_exists'] = bool(ctx_path and ctx_path.is_file())
+        cfg['resolved_context_path'] = str(ctx_path) if ctx_path else ''
+        return cfg
+
+    def save_obsidian_config(self, body):
+        if not isinstance(body, dict):
+            raise ValueError('配置格式无效')
+        vault_path = str(body.get('vault_path') or '').strip()
+        context_file = str(body.get('context_file') or '').strip()
+        enabled = bool(body.get('enabled', bool(vault_path or context_file)))
+        max_chars = int(body.get('max_chars') or 3000)
+        max_chars = max(500, min(max_chars, 12000))
+        data = {'enabled': enabled, 'vault_path': vault_path, 'context_file': context_file, 'max_chars': max_chars}
+        self._obsidian_config_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        return self.get_obsidian_config()
+
+    @staticmethod
+    def _resolve_obsidian_context_path(cfg):
+        ctx = str(cfg.get('context_file') or '').strip()
+        vault = str(cfg.get('vault_path') or '').strip()
+        if not ctx and not vault:
+            return None
+        if ctx:
+            cp = Path(ctx).expanduser()
+            if cp.is_absolute():
+                return cp
+            if vault:
+                return Path(vault).expanduser() / cp
+        return None
+
+    def _obsidian_context_block(self):
+        cfg = self.get_obsidian_config()
+        if not cfg.get('enabled'):
+            return ''
+        ctx_path = self._resolve_obsidian_context_path(cfg)
+        if not ctx_path or not ctx_path.is_file():
+            return ''
+        try:
+            text = ctx_path.read_text(encoding='utf-8').strip()
+        except Exception:
+            return ''
+        if not text:
+            return ''
+        limit = int(cfg.get('max_chars') or 3000)
+        if len(text) > limit:
+            text = text[:limit].rstrip() + '\n...（已截断，完整内容请按需读取原文件）'
+        return (
+            '\n\n【Obsidian 共享工作记忆】\n'
+            f'路径：{ctx_path}\n'
+            '说明：以下为跨平台最新活跃上下文，供衔接进度使用；请勿改写原始知识库笔记，完工后如需跨平台接力，仅在该文件「跨平台接力记录」顶部追加 1 行摘要。\n'
+            f'{text}'
+        )
+
     def launch(self, task_id):
         task = self.get(task_id)
         self.update(task_id, state='starting')
-        prompt = task['prompt'] + '\n\n【工作要求】默认用简体中文。需要生成文件时，请将最终交付物写入 tasks/' + task_id + '/交付物/。最终回复列明实际生成的文件与检查结果；没有生成文件请如实说明。不要输出任何账号凭证。'
+        prompt = (
+            task['prompt']
+            + self._obsidian_context_block()
+            + '\n\n【工作要求】默认用简体中文。需要生成文件时，请将最终交付物写入 tasks/'
+            + task_id
+            + '/交付物/。最终回复列明实际生成的文件与检查结果；没有生成文件请如实说明。不要输出任何账号凭证。'
+        )
         self._execute(task_id, task, prompt, [{'role': 'user', 'text': task['prompt']}], session_id=None)
 
     def refresh(self, task_id):
@@ -769,6 +842,8 @@ def make_handler(hub,port,token):
                         if t['state'] not in ['completed','failed','interrupted','stopped'] and t['thread_id']:
                             hub.schedule_refresh(t['id'])
                     return self.send({'tasks':tasks,'providers':hub.providers,'categories':CATEGORIES,'ready':hub.ready_error=='','error':hub.ready_error,'workspace':str(hub.workspace),'company':'汇芯','version':VERSION})
+                if path=='/api/obsidian':
+                    return self.send(hub.get_obsidian_config())
                 if path.startswith('/api/tasks/'):
                     task_id=path.split('/')[3]
                     hub.schedule_refresh(task_id)
@@ -818,6 +893,8 @@ def make_handler(hub,port,token):
                         return self.send(hub.answer_permission(task_id,body.get('option')))
                 if path=='/api/providers/sync':
                     return self.send(hub.sync_providers())
+                if path=='/api/obsidian':
+                    return self.send(hub.save_obsidian_config(body))
                 return self.send({'error':'接口不存在'},404)
             except (ValueError,RuntimeError,json.JSONDecodeError) as e:
                 return self.send({'error':scrub(e)},400)

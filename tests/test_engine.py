@@ -125,6 +125,24 @@ class EngineTest(unittest.TestCase):
     def test_scrub_hides_keys(self):
         self.assertNotIn('ck_abcdefghijklmnopqrstu', server.scrub('key=ck_abcdefghijklmnopqrstu'))
 
+    def test_obsidian_context_injected_on_launch(self):
+        vault = Path(self.tmp.name) / 'vault'
+        ctx = vault / '记忆' / '当前活跃上下文.md'
+        ctx.parent.mkdir(parents=True, exist_ok=True)
+        ctx.write_text('当前主线：测试 Obsidian 共享上下文自动注入。', encoding='utf-8')
+        cfg = self.hub.save_obsidian_config({
+            'enabled': True,
+            'vault_path': str(vault),
+            'context_file': '记忆/当前活跃上下文.md',
+            'max_chars': 1000,
+        })
+        self.assertTrue(cfg['context_exists'])
+        block = self.hub._obsidian_context_block()
+        self.assertIn('当前主线：测试 Obsidian 共享上下文自动注入。', block)
+        tid = self.create('你好')['id']
+        t = wait_state(self.hub, tid, ('completed', 'failed'))
+        self.assertEqual(t['state'], 'completed', t['error'])
+
 
 if __name__ == '__main__':
     unittest.main()
