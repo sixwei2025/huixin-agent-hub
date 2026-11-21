@@ -145,7 +145,8 @@ huixin-agent-hub/
 
 ## 致谢
 
-界面布局参考了 [zds-xiaoxin/xiaoxin-t3code](https://github.com/zds-xiaoxin/xiaoxin-t3code)（MIT）的设计思路。自 `v0.4.0` 起执行层由汇芯自研，不包含、也不依赖 T3 Code 的代码。
+- **T3 Code（[t3dotgg/t3code](https://github.com/t3dotgg/t3code)）**：感谢 T3 Code 开源项目在多智能体本地桌面工作台方向上的先驱探索与工程启发。本项目 `v0.1.0`–`v0.3.0` 曾依托官方 T3 Code 跑通 Codex / Antigravity / WorkBuddy 本机协议联调；自 `v0.4.0` 起执行层已完全自研独立，当前代码库不包含、也不依赖 T3 Code 代码。
+- **T3 星尘版（[zds-xiaoxin/xiaoxin-t3code](https://github.com/zds-xiaoxin/xiaoxin-t3code) · MIT）**：中文工作台界面布局与交互参考了该项目的设计思路。
 
 ---
 
