@@ -841,7 +841,7 @@ def make_handler(hub,port,token):
                     for t in tasks:
                         if t['state'] not in ['completed','failed','interrupted','stopped'] and t['thread_id']:
                             hub.schedule_refresh(t['id'])
-                    return self.send({'tasks':tasks,'providers':hub.providers,'categories':CATEGORIES,'ready':hub.ready_error=='','error':hub.ready_error,'workspace':str(hub.workspace),'company':'汇芯','version':VERSION})
+                    return self.send({'tasks':tasks,'providers':hub.providers,'categories':CATEGORIES,'ready':hub.ready_error=='','error':hub.ready_error,'workspace':str(hub.workspace),'obsidian':hub.get_obsidian_config(),'company':'汇芯','version':VERSION})
                 if path=='/api/obsidian':
                     return self.send(hub.get_obsidian_config())
                 if path.startswith('/api/tasks/'):
