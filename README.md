@@ -87,6 +87,11 @@ zsh app/build-desktop.sh
 
 将生成的 `汇芯智能体中台.app` 复制到 `/Applications/` 后打开，即可在中文桌面窗口里选择业务类别、执行引擎与模型，直接派活与验收交付物。
 
+### 可选：接入本地 Obsidian 共享工作记忆
+1. 打开桌面应用后，在右侧「工作区概览」点击 **「配置 Obsidian 记忆 ⚙」**（或左下角设置图标）。
+2. 填入你的 Obsidian 知识库根目录与共享上下文 Markdown 文件路径（例如 `工作记忆/当前活跃上下文.md`），保存后即写入本机 `~/.local/share/huixin-agent-hub/obsidian.json`（不入库、不上传）。
+3. 开启后每次新建任务都会自动带入该文件摘要（可设最大字数上限防撑爆），让 Codex、Antigravity、WorkBuddy 跨平台共享同一份最新进展，同时保持原始笔记只读不改。
+
 ---
 
 ## 三、五步安全调度架构
