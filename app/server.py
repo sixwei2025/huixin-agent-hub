@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -20,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '0.4.0'
+VERSION = '0.5.0'
 CATEGORIES = ['内容生产', '企业商单', '课程交付', '技能开发', '经营管理', '系统维护']
 DEFAULT_PROVIDERS = {
     'codex': {
@@ -117,6 +118,12 @@ DEFAULT_PROVIDERS = {
             'custom-local:kimi-k3': ['medium'], 'custom-local:kimi-k2.6': ['low', 'medium', 'high'],
         },
     },
+    'Registry_grokbot': {
+        'name': 'Grok Bot',
+        'models': ['default'],
+        'labels': {'default': 'Grok Bot（默认队友）'},
+        'efforts': {},
+    },
 }
 IGNORED_DIRS = {'node_modules', '.git', '__pycache__', '.venv', 'venv', 'dist', 'build', '.next'}
 
@@ -181,6 +188,11 @@ def find_provider_bin(provider):
             if candidate.is_file():
                 return [str(candidate)]
         return None
+    if provider == 'Registry_grokbot':
+        for candidate in [ROOT / 'bin/grokbot-acp', ROOT.parent / 'bin/grokbot-acp']:
+            if candidate.is_file():
+                return [str(candidate)]
+        return None
     return None
 
 class Hub:
@@ -196,6 +208,7 @@ class Hub:
         self.lock = threading.Lock()
         self.active_procs = {}
         self.stopped_tasks = set()
+        self.permissions = {}
         self.ready_error = None
         with self.db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, category TEXT, provider TEXT, model TEXT, prompt TEXT, thread_id TEXT, state TEXT, error TEXT, snapshot TEXT, created_at TEXT, updated_at TEXT, archived INTEGER DEFAULT 0, effort TEXT DEFAULT "")')
@@ -204,7 +217,7 @@ class Hub:
                 db.execute('ALTER TABLE tasks ADD COLUMN archived INTEGER DEFAULT 0')
             if 'effort' not in cols:
                 db.execute('ALTER TABLE tasks ADD COLUMN effort TEXT DEFAULT ""')
-            db.execute("UPDATE tasks SET state='failed',error='上次执行因应用退出而中断，可点击“重新发起”继续。' WHERE state IN ('queued','submitting','starting','running','working')")
+            db.execute("UPDATE tasks SET state='failed',error='上次执行因应用退出而中断，可点击“重新发起”继续。' WHERE state IN ('queued','submitting','starting','running','working','needs_input')")
         self.launch_pool.submit(self.initialize)
 
     @contextlib.contextmanager
@@ -233,6 +246,13 @@ class Hub:
         except Exception as e:
             self.ready_error = scrub(e)
 
+    def _permission_view(self, task_id):
+        with self.lock:
+            req = self.permissions.get(task_id)
+        if not req:
+            return None
+        return {'title': req['title'], 'detail': req['detail'], 'options': req['options']}
+
     def get(self, task_id):
         with self.db() as db:
             row = db.execute('SELECT * FROM tasks WHERE id=? AND COALESCE(archived,0)=0',(task_id,)).fetchone()
@@ -241,7 +261,8 @@ class Hub:
         task = dict(row)
         snapshot = json.loads(task.pop('snapshot') or '{}')
         task['messages'] = snapshot.get('messages', [])
-        task['pending'] = snapshot.get('thread',{}).get('pendingRequestCount',0)
+        task['permission'] = self._permission_view(task_id)
+        task['pending'] = 1 if task['permission'] else 0
         task['artifacts'] = self.artifacts(task_id)
         return task
 
@@ -251,8 +272,8 @@ class Hub:
         out = []
         for row in rows:
             t = dict(row)
-            snap = json.loads(t.pop('snapshot') or '{}')
-            t['pending'] = snap.get('thread', {}).get('pendingRequestCount', 0)
+            t.pop('snapshot', None)
+            t['pending'] = 1 if self._permission_view(t['id']) else 0
             out.append(t)
         return out
 
@@ -302,6 +323,74 @@ class Hub:
             fields['error'] = error
         self.update(task_id, **fields)
 
+    # ------------------------------------------------------------------
+    # 执行引擎：Codex（codex exec --json）与 ACP（agy / WorkBuddy）
+    # ------------------------------------------------------------------
+    RUNNING_STATES = ('queued', 'submitting', 'starting', 'running', 'working', 'needs_input')
+    PERMISSION_TIMEOUT = 30 * 60
+
+    def _engine_log(self, task_id):
+        folder = self.workspace / 'tasks' / task_id
+        folder.mkdir(parents=True, exist_ok=True)
+        return open(folder / '.engine.log', 'a', encoding='utf-8')
+
+    def _spawn(self, task_id, args, log):
+        # 独立进程组：停止时整组结束，避免子进程残留
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True,
+                                cwd=str(self.workspace), start_new_session=True)
+        with self.lock:
+            self.active_procs[task_id] = proc
+        return proc
+
+    @staticmethod
+    def _kill(proc):
+        if not proc:
+            return
+        if proc.poll() is not None:
+            for pipe in (proc.stdin, proc.stdout):
+                with contextlib.suppress(Exception):
+                    pipe.close()
+            return
+        with contextlib.suppress(Exception):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            with contextlib.suppress(Exception):
+                os.killpg(proc.pid, signal.SIGKILL)
+        for pipe in (proc.stdin, proc.stdout):
+            with contextlib.suppress(Exception):
+                pipe.close()
+
+    def _was_stopped(self, task_id):
+        with self.lock:
+            return task_id in self.stopped_tasks
+
+    @staticmethod
+    def _is_legacy_session(session_id):
+        # 0.3.0 及更早由 T3 创建的会话编号（如 mcp:xxxx），新引擎无法续接
+        return bool(session_id) and ':' in str(session_id)
+
+    @staticmethod
+    def _history_prompt(messages, new_text):
+        lines = ['以下是本任务此前的对话记录（原会话已无法续接，请据此继续）：']
+        for m in messages[:-1][-12:]:
+            who = '用户' if m.get('role') == 'user' else '智能体'
+            lines.append(f"【{who}】{str(m.get('text', ''))[:4000]}")
+        lines.append('【本次新需求】' + new_text)
+        return '\n\n'.join(lines)
+
+    def _finish(self, task_id, messages, reply, ok, sid, err):
+        final = list(messages)
+        if reply:
+            final.append({'role': 'assistant', 'text': reply})
+        if self._was_stopped(task_id):
+            self._save_messages(task_id, final, state='stopped', thread_id=sid, error=None)
+        elif ok:
+            self._save_messages(task_id, final, state='completed', thread_id=sid, error=None)
+        else:
+            self._save_messages(task_id, final, state='failed', thread_id=sid, error=scrub(err or '执行失败'))
+
     def _execute(self, task_id, task, prompt_text, messages, session_id=None):
         cmd = find_provider_bin(task['provider'])
         if not cmd:
@@ -309,112 +398,122 @@ class Hub:
             return
         with self.lock:
             self.stopped_tasks.discard(task_id)
+        if self._is_legacy_session(session_id) or (not session_id and len(messages) > 1):
+            prompt_text = self._history_prompt(messages, prompt_text)
+            session_id = None
+        log = self._engine_log(task_id)
+        log.write(f"\n===== {now()} {task['provider']} / {task['model']} session={session_id or 'new'} =====\n")
+        log.flush()
         try:
             if task['provider'] == 'codex':
-                self._run_codex(task_id, cmd, task, prompt_text, messages, session_id)
+                self._run_codex(task_id, cmd, task, prompt_text, messages, session_id, log)
             else:
-                self._run_acp(task_id, cmd, task, prompt_text, messages, session_id)
+                self._run_acp(task_id, cmd, task, prompt_text, messages, session_id, log)
         except Exception as e:
-            with self.lock:
-                was_stopped = task_id in self.stopped_tasks
-            if was_stopped:
-                self._save_messages(task_id, messages, state='stopped', error=None)
-            else:
-                self._save_messages(task_id, messages, state='failed', error=scrub(e))
+            log.write(f'[huixin] 异常：{scrub(e)}\n')
+            self._finish(task_id, messages, None, False, None, e)
         finally:
             with self.lock:
-                self.active_procs.pop(task_id, None)
+                proc = self.active_procs.pop(task_id, None)
+                self.permissions.pop(task_id, None)
+            self._kill(proc)
+            with contextlib.suppress(Exception):
+                log.close()
 
-    def _run_codex(self, task_id, base_cmd, task, prompt_text, messages, session_id=None):
-        args = list(base_cmd)
+    def _run_codex(self, task_id, base_cmd, task, prompt_text, messages, session_id, log):
+        args = list(base_cmd) + ['exec']
         if session_id:
-            args += ['exec', 'resume', '--json', '--skip-git-repo-check', '-m', task['model']]
-            if task.get('effort'):
-                args += ['-c', f"model_reasoning_effort={task['effort']}"]
-            args += [session_id, '-']
-        else:
-            args += ['exec', '--json', '--skip-git-repo-check', '-s', 'workspace-write', '-C', str(self.workspace), '-m', task['model']]
-            if task.get('effort'):
-                args += ['-c', f"model_reasoning_effort={task['effort']}"]
-            args += ['-']
-        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(self.workspace))
-        with self.lock:
-            self.active_procs[task_id] = proc
+            args += ['resume']
+        args += ['--json', '--skip-git-repo-check', '-m', task['model']]
+        if not session_id:
+            # 工作区可写沙箱：越界命令会失败而不是被自动放行
+            args += ['-s', 'workspace-write', '-C', str(self.workspace)]
+        if task.get('effort'):
+            args += ['-c', f"model_reasoning_effort={task['effort']}"]
+        args += ([session_id, '-'] if session_id else ['-'])
+        proc = self._spawn(task_id, args, log)
         proc.stdin.write(prompt_text)
         proc.stdin.close()
         self.update(task_id, state='running', error=None)
-        reply_parts = []
-        last_err = None
-        new_sid = session_id
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
+        parts, last_err, sid = [], None, session_id
+        for raw in proc.stdout:
+            line = raw.strip()
             if not line:
                 continue
             try:
                 ev = json.loads(line)
             except ValueError:
+                log.write(line + '\n')
                 continue
             etype = ev.get('type')
             if etype == 'thread.started' and ev.get('thread_id'):
-                new_sid = ev['thread_id']
-                self.update(task_id, thread_id=new_sid)
+                sid = ev['thread_id']
+                self.update(task_id, thread_id=sid)
             elif etype == 'item.completed':
                 item = ev.get('item') or {}
                 if item.get('type') == 'agent_message' and item.get('text'):
-                    reply_parts.append(item['text'])
-                    cur = list(messages) + [{'role': 'assistant', 'text': '\n\n'.join(reply_parts)}]
-                    self._save_messages(task_id, cur, thread_id=new_sid)
+                    parts.append(item['text'])
+                    self._save_messages(task_id, list(messages) + [{'role': 'assistant', 'text': '\n\n'.join(parts)}], thread_id=sid)
+                elif item.get('type') == 'error' and item.get('message'):
+                    log.write('[codex] ' + item['message'] + '\n')
             elif etype == 'turn.failed':
                 last_err = (ev.get('error') or {}).get('message') or '执行失败'
             elif etype == 'error' and ev.get('message'):
                 last_err = ev['message']
         rc = proc.wait()
+        if last_err:
+            log.write('[codex] 失败：' + last_err + '\n')
+        self._finish(task_id, messages, '\n\n'.join(parts), rc == 0 and not last_err, sid, last_err or f'Codex 退出码 {rc}')
+
+    def _ask_permission(self, task_id, params):
+        """把智能体的审批请求交给用户，阻塞等待选择；超时或停止时取消。"""
+        tool = params.get('toolCall') or {}
+        options = [{'id': o.get('optionId'), 'name': o.get('name') or o.get('optionId'), 'kind': o.get('kind', '')}
+                   for o in (params.get('options') or []) if o.get('optionId')]
+        detail = tool.get('rawInput')
+        req = {'title': tool.get('title') or tool.get('kind') or '智能体请求执行操作',
+               'detail': json.dumps(detail, ensure_ascii=False)[:1500] if detail else '',
+               'options': options, 'event': threading.Event(), 'choice': None}
         with self.lock:
-            was_stopped = task_id in self.stopped_tasks
-        final_msgs = list(messages)
-        if reply_parts:
-            final_msgs.append({'role': 'assistant', 'text': '\n\n'.join(reply_parts)})
-        if was_stopped:
-            self._save_messages(task_id, final_msgs, state='stopped', thread_id=new_sid, error=None)
-        elif rc == 0 and not last_err:
-            self._save_messages(task_id, final_msgs, state='completed', thread_id=new_sid, error=None)
-        else:
-            self._save_messages(task_id, final_msgs, state='failed', thread_id=new_sid, error=scrub(last_err or f'Codex 退出码 {rc}'))
-
-    def _run_acp(self, task_id, base_cmd, task, prompt_text, messages, session_id=None):
-        proc = subprocess.Popen(list(base_cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, cwd=str(self.workspace))
+            self.permissions[task_id] = req
+        self.update(task_id, state='needs_input')
+        req['event'].wait(self.PERMISSION_TIMEOUT)
         with self.lock:
-            self.active_procs[task_id] = proc
-        rpc_seq = 0
+            self.permissions.pop(task_id, None)
+        if not self._was_stopped(task_id):
+            self.update(task_id, state='running')
+        return req['choice']
 
-        def send_rpc(method, params):
-            nonlocal rpc_seq
-            rpc_seq += 1
-            rid = rpc_seq
-            proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'method': method, 'params': params}, ensure_ascii=False) + '\n')
+    def answer_permission(self, task_id, option_id):
+        self.get(task_id)
+        with self.lock:
+            req = self.permissions.get(task_id)
+        if not req:
+            raise ValueError('该任务当前没有待审批的操作')
+        if option_id is not None and option_id not in {o['id'] for o in req['options']}:
+            raise ValueError('无效的审批选项')
+        req['choice'] = option_id
+        req['event'].set()
+        return self.get(task_id)
+
+    def _run_acp(self, task_id, base_cmd, task, prompt_text, messages, session_id, log):
+        proc = self._spawn(task_id, list(base_cmd), log)
+        seq = 0
+        chunks = []
+        collect = {'on': False}
+        last_flush = [time.monotonic()]
+
+        def write(obj):
+            proc.stdin.write(json.dumps(obj, ensure_ascii=False) + '\n')
             proc.stdin.flush()
-            return rid
 
-        def reply_permission(req_id, params):
-            options = params.get('options') or []
-            chosen = None
-            for opt in options:
-                if opt.get('kind') in ('allow_once', 'allow_always') or 'allow' in str(opt.get('optionId', '')).lower():
-                    chosen = opt.get('optionId')
-                    break
-            if not chosen and options:
-                chosen = options[0].get('optionId')
-            if chosen:
-                proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': req_id, 'result': {'outcome': {'outcome': 'selected', 'optionId': chosen}}}) + '\n')
-            else:
-                proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': req_id, 'result': {'outcome': {'outcome': 'cancelled'}}}) + '\n')
-            proc.stdin.flush()
+        def send(method, params):
+            nonlocal seq
+            seq += 1
+            write({'jsonrpc': '2.0', 'id': seq, 'method': method, 'params': params})
+            return seq
 
-        reply_chunks = []
-        last_flush = time.monotonic()
-
-        def wait_rpc(target_id):
-            nonlocal last_flush
+        def wait(target):
             while True:
                 line = proc.stdout.readline()
                 if not line:
@@ -422,71 +521,74 @@ class Hub:
                 try:
                     obj = json.loads(line)
                 except ValueError:
+                    log.write(line)
                     continue
-                if obj.get('id') == target_id and ('result' in obj or 'error' in obj):
+                if obj.get('id') == target and ('result' in obj or 'error' in obj) and 'method' not in obj:
                     return obj
-                if 'id' in obj and obj.get('method') == 'session/request_permission':
-                    reply_permission(obj['id'], obj.get('params') or {})
-                elif obj.get('method') == 'session/update':
+                method = obj.get('method')
+                if method == 'session/request_permission' and 'id' in obj:
+                    params = obj.get('params') or {}
+                    log.write('[huixin] 审批请求：' + json.dumps(params.get('toolCall') or {}, ensure_ascii=False)[:500] + '\n')
+                    choice = self._ask_permission(task_id, params)
+                    log.write(f'[huixin] 审批结果：{choice or "取消"}\n')
+                    outcome = {'outcome': 'selected', 'optionId': choice} if choice else {'outcome': 'cancelled'}
+                    write({'jsonrpc': '2.0', 'id': obj['id'], 'result': {'outcome': outcome}})
+                elif 'id' in obj and method:
+                    # 未支持的客户端能力（读写文件、终端等）明确拒绝，避免引擎卡死
+                    write({'jsonrpc': '2.0', 'id': obj['id'], 'error': {'code': -32601, 'message': 'Method not supported by client'}})
+                elif method == 'session/update' and collect['on']:
                     upd = (obj.get('params') or {}).get('update') or {}
                     if upd.get('sessionUpdate') == 'agent_message_chunk':
-                        chunk = (upd.get('content') or {}).get('text')
-                        if chunk:
-                            reply_chunks.append(chunk)
-                            if time.monotonic() - last_flush > 0.4:
-                                cur = list(messages) + [{'role': 'assistant', 'text': ''.join(reply_chunks)}]
-                                self._save_messages(task_id, cur)
-                                last_flush = time.monotonic()
+                        text = (upd.get('content') or {}).get('text')
+                        if text:
+                            chunks.append(text)
+                            if time.monotonic() - last_flush[0] > 0.4:
+                                self._save_messages(task_id, list(messages) + [{'role': 'assistant', 'text': ''.join(chunks)}])
+                                last_flush[0] = time.monotonic()
 
-        try:
-            init_res = wait_rpc(send_rpc('initialize', {'protocolVersion': 1, 'clientCapabilities': {}, 'clientInfo': {'name': 'huixin-hub', 'version': VERSION}}))
-            if not init_res or 'error' in init_res:
-                raise RuntimeError((init_res or {}).get('error', {}).get('message', 'ACP 初始化失败'))
-            if session_id:
-                sess_res = wait_rpc(send_rpc('session/load', {'sessionId': session_id, 'cwd': str(self.workspace), 'mcpServers': []}))
+        def err_of(res, default):
+            return ((res or {}).get('error') or {}).get('message') or default
+
+        init = wait(send('initialize', {'protocolVersion': 1, 'clientCapabilities': {}, 'clientInfo': {'name': 'huixin-hub', 'version': VERSION}}))
+        if not init or 'error' in init:
+            raise RuntimeError(err_of(init, 'ACP 初始化失败'))
+        sess, sid = None, None
+        if session_id:
+            # session/load 会重放历史消息；此时不收集，避免旧回复拼进新回复
+            sess = wait(send('session/load', {'sessionId': session_id, 'cwd': str(self.workspace), 'mcpServers': []}))
+            if sess and 'result' in sess:
                 sid = session_id
             else:
-                sess_res = wait_rpc(send_rpc('session/new', {'cwd': str(self.workspace), 'mcpServers': []}))
-                sid = (sess_res or {}).get('result', {}).get('sessionId')
-            if not sess_res or 'error' in sess_res or not sid:
-                raise RuntimeError((sess_res or {}).get('error', {}).get('message', '创建会话失败'))
-            self.update(task_id, thread_id=sid, state='running', error=None)
-            wait_rpc(send_rpc('session/set_mode', {'sessionId': sid, 'modeId': 'auto'}))
-            wait_rpc(send_rpc('session/set_model', {'sessionId': sid, 'modelId': task['model']}))
-            if task.get('effort'):
-                cfg_opts = (sess_res.get('result') or {}).get('configOptions') or []
-                for opt in cfg_opts:
-                    if opt.get('id') in ('thought_level', 'reasoning_effort', 'effort'):
-                        wait_rpc(send_rpc('session/set_config_option', {'sessionId': sid, 'configId': opt['id'], 'value': task['effort']}))
-                        break
-            prompt_res = wait_rpc(send_rpc('session/prompt', {'sessionId': sid, 'prompt': [{'type': 'text', 'text': prompt_text}]}))
-            with self.lock:
-                was_stopped = task_id in self.stopped_tasks
-            final_msgs = list(messages)
-            if reply_chunks:
-                final_msgs.append({'role': 'assistant', 'text': ''.join(reply_chunks)})
-            if was_stopped:
-                self._save_messages(task_id, final_msgs, state='stopped', thread_id=sid, error=None)
-            elif prompt_res and 'result' in prompt_res:
-                self._save_messages(task_id, final_msgs, state='completed', thread_id=sid, error=None)
-            else:
-                err_msg = ((prompt_res or {}).get('error') or {}).get('message') or '智能体执行未返回结果'
-                self._save_messages(task_id, final_msgs, state='failed', thread_id=sid, error=scrub(err_msg))
-        finally:
-            with contextlib.suppress(Exception):
-                proc.terminate()
-                proc.wait(timeout=3)
+                log.write('[huixin] 会话续接失败，改为带历史新建：' + err_of(sess, '未知') + '\n')
+                prompt_text = self._history_prompt(messages, prompt_text)
+        if not sid:
+            sess = wait(send('session/new', {'cwd': str(self.workspace), 'mcpServers': []}))
+            sid = ((sess or {}).get('result') or {}).get('sessionId')
+            if not sid:
+                raise RuntimeError(err_of(sess, '创建会话失败'))
+        self.update(task_id, thread_id=sid, state='running', error=None)
+        # auto：常规编辑与安全命令自动执行，高风险/不可逆操作会发起审批交由用户决定
+        wait(send('session/set_mode', {'sessionId': sid, 'modeId': 'auto'}))
+        wait(send('session/set_model', {'sessionId': sid, 'modelId': task['model']}))
+        if task.get('effort'):
+            res = wait(send('session/set_config_option', {'sessionId': sid, 'configId': 'thought_level', 'value': task['effort']}))
+            if not res or 'error' in res:
+                log.write('[huixin] 思考档位设置失败：' + err_of(res, '未知') + '\n')
+        collect['on'] = True
+        res = wait(send('session/prompt', {'sessionId': sid, 'prompt': [{'type': 'text', 'text': prompt_text}]}))
+        ok = bool(res and 'result' in res)
+        self._finish(task_id, messages, ''.join(chunks), ok, sid, err_of(res, '智能体执行未返回结果'))
 
-    def launch(self,task_id):
-        task=self.get(task_id)
-        self.update(task_id,state='starting')
-        prompt = task['prompt']+'\n\n【工作要求】默认用简体中文。需要生成文件时，请将最终交付物写入 tasks/'+task_id+'/交付物/。最终回复列明实际生成的文件与检查结果；没有生成文件请如实说明。不要输出任何账号凭证。'
+    def launch(self, task_id):
+        task = self.get(task_id)
+        self.update(task_id, state='starting')
+        prompt = task['prompt'] + '\n\n【工作要求】默认用简体中文。需要生成文件时，请将最终交付物写入 tasks/' + task_id + '/交付物/。最终回复列明实际生成的文件与检查结果；没有生成文件请如实说明。不要输出任何账号凭证。'
         self._execute(task_id, task, prompt, [{'role': 'user', 'text': task['prompt']}], session_id=None)
 
-    def refresh(self,task_id):
+    def refresh(self, task_id):
         return self.get(task_id)
 
-    def schedule_refresh(self,task_id,force=False):
+    def schedule_refresh(self, task_id, force=False):
         pass
 
     def stop_task(self, task_id):
@@ -494,20 +596,20 @@ class Hub:
         with self.lock:
             self.stopped_tasks.add(task_id)
             proc = self.active_procs.get(task_id)
-        if proc and proc.poll() is None:
-            with contextlib.suppress(Exception):
-                proc.terminate()
+            req = self.permissions.get(task_id)
+        if req:
+            req['choice'] = None
+            req['event'].set()
+        self._kill(proc)
         self.update(task_id, state='stopped', error=None)
         return self.get(task_id)
 
-    def followup(self,task_id,message):
-        task=self.get(task_id)
-        if not task['thread_id']:
-            raise ValueError('任务尚未创建成功，请稍候或重新发起')
-        if task['state'] in ('queued', 'submitting', 'starting', 'running', 'working'):
+    def followup(self, task_id, message):
+        task = self.get(task_id)
+        if task['state'] in self.RUNNING_STATES:
             raise ValueError('当前任务正在执行中，请等待完成或先停止任务')
-        message=str(message).strip()
-        if not message or len(message)>30000:
+        message = str(message).strip()
+        if not message or len(message) > 30000:
             raise ValueError('请输入后续需求，最多 30,000 字')
         messages = list(task.get('messages') or [{'role': 'user', 'text': task['prompt']}])
         messages.append({'role': 'user', 'text': message})
@@ -568,6 +670,18 @@ class Hub:
                     efforts[m['modelId']] = [e['value'] for e in m.get('_meta', {}).get('effortOptions', []) if e.get('value')]
                 updated['Registry_workbuddy']['labels'] = labels
                 updated['Registry_workbuddy']['efforts'] = efforts
+        grok_cmd = find_provider_bin('Registry_grokbot')
+        if grok_cmd:
+            grok_models = probe_acp_models(grok_cmd)
+            if grok_models:
+                updated.setdefault('Registry_grokbot', {'name': 'Grok Bot'})
+                updated['Registry_grokbot']['models'] = [m['modelId'] for m in grok_models]
+                labels = {}
+                for m in grok_models:
+                    desc = f" ({m['description']})" if m.get('description') else ''
+                    labels[m['modelId']] = f"{m.get('name') or m['modelId']}{desc}"
+                updated['Registry_grokbot']['labels'] = labels
+                updated['Registry_grokbot']['efforts'] = {}
         self.providers = updated
         (self.data / 'providers.json').write_text(json.dumps(updated, ensure_ascii=False, indent=2) + '\n')
         return {'ok': True, 'providers': updated}
@@ -700,6 +814,8 @@ def make_handler(hub,port,token):
                         return self.send(hub.retry(task_id),201)
                     if action=='stop':
                         return self.send(hub.stop_task(task_id))
+                    if action=='permission':
+                        return self.send(hub.answer_permission(task_id,body.get('option')))
                 if path=='/api/providers/sync':
                     return self.send(hub.sync_providers())
                 return self.send({'error':'接口不存在'},404)

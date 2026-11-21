@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""ACP (Agent Client Protocol) stdio JSON-RPC 2.0 bridge for Grok Bot via grokbot-cli."""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import uuid
+
+
+def find_grokbot_bin():
+    env_bin = os.getenv('GROKBOT_BIN')
+    if env_bin and Path(env_bin).is_file():
+        return env_bin
+    for candidate in [
+        shutil.which('grokbot'),
+        str(Path.home() / '.local/bin/grokbot'),
+        str(Path.home() / '.cargo/bin/grokbot'),
+        '/opt/homebrew/bin/grokbot',
+        '/usr/local/bin/grokbot',
+    ]:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def list_grokbot_models(grokbot_bin):
+    fallback = [{'modelId': 'default', 'name': 'Grok Bot（默认队友）', 'description': '请先运行 grokbot login 完成登录'}]
+    if not grokbot_bin:
+        return fallback
+    try:
+        res = subprocess.run(
+            [grokbot_bin, 'agents', '--json'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode != 0:
+            return fallback
+        models = []
+        for raw in res.stdout.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            agent = obj.get('agent') if isinstance(obj.get('agent'), dict) else obj
+            aid = agent.get('agentId') or agent.get('id')
+            name = agent.get('name') or aid
+            if not aid:
+                continue
+            status = obj.get('status') or {}
+            state_desc = '运行中' if (status.get('live') or {}).get('isRunning') else '在线'
+            models.append({
+                'modelId': str(aid),
+                'name': str(name),
+                'description': state_desc,
+            })
+        return models or fallback
+    except Exception:
+        return fallback
+
+
+def send_json(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    sys.stdout.flush()
+
+
+def main():
+    grokbot_bin = find_grokbot_bin()
+    sessions = {}
+
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            req = json.loads(raw)
+        except ValueError:
+            continue
+
+        req_id = req.get('id')
+        method = req.get('method')
+        params = req.get('params') or {}
+
+        if method == 'initialize':
+            send_json({
+                'jsonrpc': '2.0',
+                'id': req_id,
+                'result': {
+                    'protocolVersion': 1,
+                    'agentInfo': {'name': 'grokbot-acp', 'version': '0.1.0'},
+                    'agentCapabilities': {'loadSession': True},
+                },
+            })
+        elif method == 'session/new':
+            sid = str(uuid.uuid4())
+            models = list_grokbot_models(grokbot_bin)
+            default_model = models[0]['modelId'] if models else 'default'
+            sessions[sid] = {'model': default_model}
+            send_json({
+                'jsonrpc': '2.0',
+                'id': req_id,
+                'result': {
+                    'sessionId': sid,
+                    'models': {
+                        'currentModelId': default_model,
+                        'availableModels': models,
+                    },
+                },
+            })
+        elif method == 'session/load':
+            sid = params.get('sessionId') or str(uuid.uuid4())
+            models = list_grokbot_models(grokbot_bin)
+            default_model = models[0]['modelId'] if models else 'default'
+            sessions.setdefault(sid, {'model': default_model})
+            send_json({
+                'jsonrpc': '2.0',
+                'id': req_id,
+                'result': {
+                    'models': {
+                        'currentModelId': sessions[sid]['model'],
+                        'availableModels': models,
+                    },
+                },
+            })
+        elif method == 'session/set_mode':
+            send_json({'jsonrpc': '2.0', 'id': req_id, 'result': {}})
+        elif method == 'session/set_model':
+            sid = params.get('sessionId')
+            mid = params.get('modelId')
+            if sid in sessions and mid:
+                sessions[sid]['model'] = mid
+            send_json({'jsonrpc': '2.0', 'id': req_id, 'result': {}})
+        elif method == 'session/set_config_option':
+            send_json({'jsonrpc': '2.0', 'id': req_id, 'result': {}})
+        elif method == 'session/prompt':
+            sid = params.get('sessionId')
+            if not grokbot_bin:
+                send_json({
+                    'jsonrpc': '2.0',
+                    'id': req_id,
+                    'error': {'code': -32002, 'message': '未找到 grokbot 可执行程序，请先编译安装 grokbot-cli。'},
+                })
+                continue
+
+            prompt_items = params.get('prompt') or []
+            prompt_text = '\n'.join(
+                str(item.get('text', ''))
+                for item in prompt_items
+                if isinstance(item, dict) and item.get('type') == 'text'
+            ).strip()
+            if not prompt_text:
+                send_json({'jsonrpc': '2.0', 'id': req_id, 'result': {'stopReason': 'end_turn'}})
+                continue
+
+            agent_id = (sessions.get(sid) or {}).get('model')
+            cmd = [grokbot_bin, 'ask', '--json']
+            if agent_id and agent_id != 'default':
+                cmd += ['-a', agent_id]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                proc.stdin.write(prompt_text)
+                proc.stdin.close()
+
+                emitted_any = False
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    etype = ev.get('type')
+                    if etype == 'reply':
+                        text = ev.get('text') or ''
+                        if text:
+                            if emitted_any:
+                                text = '\n\n' + text
+                            emitted_any = True
+                            send_json({
+                                'jsonrpc': '2.0',
+                                'method': 'session/update',
+                                'params': {
+                                    'sessionId': sid,
+                                    'update': {
+                                        'sessionUpdate': 'agent_message_chunk',
+                                        'content': {'type': 'text', 'text': text},
+                                    },
+                                },
+                            })
+                    elif etype == 'needs_input':
+                        what = ev.get('what') or '交互确认'
+                        note = f'\n\n[Grok Bot 等待人工确认：{what}，请打开 Grok Bot 桌面端处理]'
+                        emitted_any = True
+                        send_json({
+                            'jsonrpc': '2.0',
+                            'method': 'session/update',
+                            'params': {
+                                'sessionId': sid,
+                                'update': {
+                                    'sessionUpdate': 'agent_message_chunk',
+                                    'content': {'type': 'text', 'text': note},
+                                },
+                            },
+                        })
+
+                stderr_text = (proc.stderr.read() or '').strip()
+                rc = proc.wait()
+                if rc == 0:
+                    send_json({'jsonrpc': '2.0', 'id': req_id, 'result': {'stopReason': 'end_turn'}})
+                elif rc == 3:
+                    send_json({
+                        'jsonrpc': '2.0',
+                        'id': req_id,
+                        'error': {'code': -32001, 'message': 'Grok Bot 未登录或会话已过期，请在终端执行 grokbot login --from-app 或 grokbot login'},
+                    })
+                else:
+                    msg = stderr_text or f'grokbot 退出码 {rc}'
+                    send_json({'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': msg[-1000:]}})
+            except Exception as exc:
+                send_json({'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32000, 'message': str(exc)}})
+        elif req_id is not None:
+            send_json({'jsonrpc': '2.0', 'id': req_id, 'result': {}})
+
+
+if __name__ == '__main__':
+    main()

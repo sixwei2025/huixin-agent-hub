@@ -9,7 +9,8 @@ cp "$app_source/web/index.html" "$desktop_bundle/Contents/Resources/web/index.ht
 cp "$app_source/web/brand.svg" "$desktop_bundle/Contents/Resources/web/brand.svg"
 cp "$app_source/../bin/workbuddy-acp" "$desktop_bundle/Contents/Resources/bin/workbuddy-acp"
 cp "$app_source/../bin/acp_stdio_bridge.py" "$desktop_bundle/Contents/Resources/bin/acp_stdio_bridge.py"
-chmod +x "$desktop_bundle/Contents/Resources/bin/workbuddy-acp" "$desktop_bundle/Contents/Resources/bin/acp_stdio_bridge.py"
+cp "$app_source/../bin/grokbot-acp" "$desktop_bundle/Contents/Resources/bin/grokbot-acp"
+chmod +x "$desktop_bundle/Contents/Resources/bin/workbuddy-acp" "$desktop_bundle/Contents/Resources/bin/acp_stdio_bridge.py" "$desktop_bundle/Contents/Resources/bin/grokbot-acp"
 icon_work=$(mktemp -d)
 mkdir -p "$icon_work/Brand.iconset"
 /usr/bin/swift "$app_source/make-icon.swift" "$icon_work/Brand.iconset"
@@ -24,8 +25,8 @@ cat > "$desktop_bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>汇芯智能体中台</string>
 <key>CFBundleExecutable</key><string>HuixinHub</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.4.0</string>
-<key>CFBundleVersion</key><string>5</string>
+<key>CFBundleShortVersionString</key><string>0.5.0</string>
+<key>CFBundleVersion</key><string>6</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>

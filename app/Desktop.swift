@@ -6,7 +6,7 @@ final class HubDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var webView: WKWebView!
     var server: Process?
     var fileWindows: [NSWindow] = []
-    let targetVersion = "0.4.0"
+    let targetVersion = "0.5.0"
     let address = URL(string: "http://127.0.0.1:39261/")!
     let healthAddress = URL(string: "http://127.0.0.1:39261/api/health")!
 
