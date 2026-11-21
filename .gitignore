@@ -1,0 +1,12 @@
+# 构建产物
+*.app/
+__pycache__/
+*.pyc
+.DS_Store
+# 含密钥/账号截图与内部排障记录，禁止入库
+WorkBuddy专用密钥*.png
+WorkBuddy网页登录结果.png
+中文中台连接核验.png
+secrets/
+*.key
+.env

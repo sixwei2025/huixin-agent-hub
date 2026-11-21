@@ -1,0 +1,11 @@
+#!/bin/sh
+# Reuse the WorkBuddy runtime; keep its own approval checks enabled.
+export ELECTRON_RUN_AS_NODE=1
+export CODEBUDDY_FORCE_LITE_WB_BUNDLE=1
+export CODEBUDDY_INTERNET_ENVIRONMENT=internal
+credential_file="$HOME/.local/share/huixin-agent-hub/secrets/workbuddy-api-key"
+if [ -r "$credential_file" ]; then
+    CODEBUDDY_API_KEY=$(cat "$credential_file")
+    export CODEBUDDY_API_KEY
+fi
+exec /usr/bin/python3 "$(dirname "$0")/acp_stdio_bridge.py" /Applications/WorkBuddy.app/Contents/MacOS/Electron "/Applications/WorkBuddy.app/Contents/Resources/app.asar/cli/bin/codebuddy" --serve --acp "$@"
