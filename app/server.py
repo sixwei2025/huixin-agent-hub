@@ -677,17 +677,29 @@ class Hub:
         self.update(task_id, state='stopped', error=None)
         return self.get(task_id)
 
-    def followup(self, task_id, message):
+    def followup(self, task_id, message, provider=None, model=None, effort=None):
         task = self.get(task_id)
         if task['state'] in self.RUNNING_STATES:
             raise ValueError('当前任务正在执行中，请等待完成或先停止任务')
         message = str(message).strip()
         if not message or len(message) > 30000:
             raise ValueError('请输入后续需求，最多 30,000 字')
+        next_provider = str(provider).strip() if provider else task['provider']
+        if next_provider not in self.providers:
+            raise ValueError('所选执行工具不可用')
+        allowed_models = self.providers[next_provider].get('models') or []
+        next_model = str(model).strip() if model else (task['model'] if next_provider == task['provider'] else (allowed_models[0] if allowed_models else ''))
+        if allowed_models and next_model not in allowed_models:
+            raise ValueError('所选模型不可用')
+        next_effort = str(effort or '').strip() if (effort is not None or next_provider != task['provider'] or next_model != task['model']) else (task.get('effort') or '')
+        session_id = task['thread_id'] if next_provider == task['provider'] else None
+        if next_provider != task['provider'] or next_model != task['model'] or next_effort != (task.get('effort') or ''):
+            self.update(task_id, provider=next_provider, model=next_model, effort=next_effort, thread_id=session_id)
+            task = self.get(task_id)
         messages = list(task.get('messages') or [{'role': 'user', 'text': task['prompt']}])
         messages.append({'role': 'user', 'text': message})
         self._save_messages(task_id, messages, state='starting', error=None)
-        self.launch_pool.submit(self._execute, task_id, task, message, messages, task['thread_id'])
+        self.launch_pool.submit(self._execute, task_id, task, message, messages, session_id)
         return self.get(task_id)
 
     def archive(self,task_id):
@@ -877,7 +889,7 @@ def make_handler(hub,port,token):
                 if len(parts)==4 and parts[:2]==['api','tasks']:
                     task_id,action=parts[2],parts[3]
                     if action=='message':
-                        return self.send(hub.followup(task_id,body.get('message','')))
+                        return self.send(hub.followup(task_id,body.get('message',''),body.get('provider'),body.get('model'),body.get('effort')))
                     if action=='refresh':
                         hub.refresh(task_id)
                         return self.send(hub.get(task_id))

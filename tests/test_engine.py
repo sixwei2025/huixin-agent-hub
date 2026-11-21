@@ -139,9 +139,19 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(cfg['context_exists'])
         block = self.hub._obsidian_context_block()
         self.assertIn('当前主线：测试 Obsidian 共享上下文自动注入。', block)
+        tid = self.create('你好')
+        t = wait_state(self.hub, tid['id'], ('completed', 'failed'))
+        self.assertEqual(t['state'], 'completed', t['error'])
+
+    def test_followup_can_switch_model_and_provider(self):
         tid = self.create('你好')['id']
+        wait_state(self.hub, tid, ('completed',))
+        self.hub.followup(tid, '换模型继续', provider='acpRegistry_antigravity_local', model='gemini-4-neon-high')
         t = wait_state(self.hub, tid, ('completed', 'failed'))
         self.assertEqual(t['state'], 'completed', t['error'])
+        self.assertEqual(t['provider'], 'acpRegistry_antigravity_local')
+        self.assertEqual(t['model'], 'gemini-4-neon-high')
+        self.assertEqual(t['messages'][-1]['text'], '收到历史')
 
 
 if __name__ == '__main__':
